@@ -9,7 +9,7 @@ import torch
 import numpy as np
 from PIL import Image
 import folder_paths
-
+import torchvision.transforms as transforms 
 from huggingface_hub import hf_hub_download
 from insightface.app import FaceAnalysis
 from .pipeline_stable_diffusion_xl_instantid import StableDiffusionXLInstantIDPipeline, draw_kps
@@ -122,7 +122,8 @@ class IDBaseModelLoader_fromhub_Node_Zho:
             base_model_path,
             controlnet=controlnet,
             torch_dtype=torch.float16,
-            local_dir="./checkpoints"
+            local_dir="./checkpoints",
+            variant="fp16"
         ).to(device)
         return [pipe]
 
@@ -218,6 +219,38 @@ class ID_Prompt_Style_Zho:
         return prompt, negative_prompt
 
 
+class ID_Preprocessor_Zho:
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "insightface": ("INSIGHTFACEMODEL",),
+            }
+        }
+
+    RETURN_TYPES = ('IMAGE', 'EMBEDDING')
+    RETURN_NAMES = ('pose', 'embedding')
+    FUNCTION = "preprocessing"
+    CATEGORY = "📷InstantID"
+
+    def preprocessing(self, image, insightface):
+        image = resize_img(image)
+        
+        # prepare face emb
+        face_info = insightface.get(cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR))
+        if not face_info:
+            return "No face detected"
+
+        face_info = sorted(face_info, key=lambda x: (x['bbox'][2] - x['bbox'][0]) * (x['bbox'][3] - x['bbox'][1]))[-1]
+        face_kps = draw_kps(image, face_info['kps'])
+        
+        return face_kps, face_info['embedding']
+    
+
 class IDGenerationNode_Zho:
     def __init__(self):
         pass
@@ -226,20 +259,20 @@ class IDGenerationNode_Zho:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "face_image": ("IMAGE",),
                 "pipe": ("MODEL",),
-                "insightface": ("INSIGHTFACEMODEL",),
+                "face_embedding": ("EMBEDDING",),
                 "positive": ("STRING", {"multiline": True, "forceInput": True}),
                 "negative": ("STRING", {"multiline": True, "forceInput": True}),
                 "ip_adapter_scale": ("FLOAT", {"default": 0.8, "min": 0, "max": 1.0, "display": "slider"}),
                 "controlnet_conditioning_scale": ("FLOAT", {"default": 0.8, "min": 0, "max": 1.0, "display": "slider"}),
                 "steps": ("INT", {"default": 50, "min": 1, "max": 100, "step": 1, "display": "slider"}),
                 "guidance_scale": ("FLOAT", {"default": 5, "min": 0, "max": 10, "display": "slider"}),
-                "enhance_face_region": ("BOOLEAN", {"default": True}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "control_images_optional": ("IMAGE",),
+                "width": ("INT", {"default": 1024, "min": 512, "max": 2048, "step": 32, "display": "slider"}),
+                "height": ("INT", {"default": 1024, "min": 512, "max": 2048, "step": 32, "display": "slider"}), 
             },
             "optional": {
-                "pose_image_optional": ("IMAGE",), 
             }
         }
 
@@ -247,40 +280,9 @@ class IDGenerationNode_Zho:
     FUNCTION = "id_generate_image"
     CATEGORY = "📷InstantID"
                        
-    def id_generate_image(self, insightface, positive, negative, face_image, pipe, ip_adapter_scale, controlnet_conditioning_scale, steps, guidance_scale, seed, enhance_face_region, pose_image_optional=None):
+    def id_generate_image(self, width, height, face_embedding, positive, negative, pipe, ip_adapter_scale, controlnet_conditioning_scale, steps, guidance_scale, seed, control_images_optional=None):
+        face_emb = face_embedding
 
-        face_image = resize_img(face_image)
-        
-        # prepare face emb
-        face_info = insightface.get(cv2.cvtColor(np.array(face_image), cv2.COLOR_RGB2BGR))
-        if not face_info:
-            return "No face detected"
-
-        face_info = sorted(face_info, key=lambda x: (x['bbox'][2] - x['bbox'][0]) * (x['bbox'][3] - x['bbox'][1]))[-1]
-        face_emb = face_info['embedding']
-        face_kps = draw_kps(face_image, face_info['kps'])
-        width, height = face_kps.size
-
-        if pose_image_optional is not None:
-            pose_image = resize_img(pose_image_optional)
-            face_info = insightface.get(cv2.cvtColor(np.array(pose_image), cv2.COLOR_RGB2BGR))
-            if len(face_info) == 0:
-                raise gr.Error(f"Cannot find any face in the reference image! Please upload another person image")
-        
-            face_info = face_info[-1]
-            face_kps = draw_kps(pose_image, face_info['kps'])
-        
-            width, height = face_kps.size
-
-        if enhance_face_region:
-            control_mask = np.zeros([height, width, 3])
-            x1, y1, x2, y2 = face_info['bbox']
-            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-            control_mask[y1:y2, x1:x2] = 255
-            control_mask = Image.fromarray(control_mask.astype(np.uint8))
-        else:
-            control_mask = None
-            
         generator = torch.Generator(device=device).manual_seed(seed)
 
         pipe.set_ip_adapter_scale(ip_adapter_scale)
@@ -289,8 +291,7 @@ class IDGenerationNode_Zho:
             prompt=positive,
             negative_prompt=negative,
             image_embeds=face_emb,
-            image=face_kps,
-            control_mask=control_mask,
+            image=control_images_optional,
             controlnet_conditioning_scale=controlnet_conditioning_scale,
             num_inference_steps=steps,
             generator=generator,
@@ -338,7 +339,8 @@ NODE_CLASS_MAPPINGS = {
     "IDBaseModelLoader_local": IDBaseModelLoader_local_Node_Zho,
     "Ipadapter_instantidLoader": Ipadapter_instantidLoader_Node_Zho,
     "ID_Prompt_Styler": ID_Prompt_Style_Zho,
-    "IDGenerationNode": IDGenerationNode_Zho
+    "IDGenerationNode": IDGenerationNode_Zho,
+    "ID_Preprocessor_Zho": ID_Preprocessor_Zho
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -348,5 +350,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "IDBaseModelLoader_local": "📷ID Base Model Loader locally",
     "Ipadapter_instantidLoader": "📷Ipadapter_instantid Loader",
     "ID_Prompt_Styler": "📷ID Prompt_Styler",
-    "IDGenerationNode": "📷InstantID Generation"
+    "IDGenerationNode": "📷InstantID Generation",
+    "ID_Preprocessor_Zho": "📷ID Preprocessor"
 }
